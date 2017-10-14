@@ -19,12 +19,14 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #define POINTS 0
+#define WIREFRAME 0
+
 #define DEBUG_DEPTH 0
 #define DEBUG_NORMALS 0
 
-#define TEXTURE 1
-#define TEXTURE_PERSP_CORRECT 1
-#define TEXTURE_BILINEAR_FILT 1
+#define TEXTURE 0
+#define TEXTURE_PERSP_CORRECT 0
+#define TEXTURE_BILINEAR_FILT 0
 
 namespace {
 
@@ -152,8 +154,7 @@ glm::vec3 getColor(Fragment &fragment, glm::vec2 uv) {
   //    convert to 1D index
   //    scale by 3
 
-  int index = uv.x + uv.y * fragment.texWidth;
-  index *= 3;
+  int index = ((int)uv.x + (int)uv.y * fragment.texWidth) * 3;
   glm::vec3 col(fragment.dev_diffuseTex[index],
     fragment.dev_diffuseTex[index + 1],
     fragment.dev_diffuseTex[index + 2]);
@@ -204,7 +205,7 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
       glm::vec3 &outPix = framebuffer[index];
       Fragment &frag = fragmentBuffer[index];
 		  
-#if POINTS
+#if POINTS || WIREFRAME
       outPix = frag.color;
 
 #elif DEBUG_DEPTH
@@ -755,7 +756,6 @@ void _vertexTransformAndAssembly(
 #endif
 		// TODO: Apply vertex assembly here
 		// Assemble all attribute arraies into the primitive array
-		
 	}
 }
 
@@ -788,6 +788,30 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 
 
 
+
+/**
+* Creates a line from two points (A and B) using Digital Differential Analyzer (DDA) Algorithm
+*
+* Reference: http://www.geeksforgeeks.org/dda-line-generation-algorithm-computer-graphics/
+*/
+__device__
+void drawLine(glm::vec3 A, glm::vec3 B, Fragment *fragBuf, int *depthBuf, int width, int height) {
+  float dx = B.x - A.x;
+  float dy = B.y - A.y;
+  float steps = fabs(dx) > fabs(dy) ? dx : dy;
+  dx /= fabs(steps);
+  dy /= fabs(steps);
+
+  float x = A.x, y = A.y;
+  for (int i = 0; i < steps; i++) {
+    int index = (int)x + (int)y * width;
+    fragBuf[index].color = glm::vec3(0.98);
+    x += dx;
+    y += dy;
+  }
+}
+
+
 __global__
 void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragBuf, int *depthBuf, int width, int height) {
 
@@ -807,17 +831,25 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
 #if POINTS
 
     for (int i = 0; i < 3; i++) {
-      int index = tri[i].x + (tri[i].y * width);
+      int x = tri[i].x;
+      int y = tri[i].y;
+      int index = x + (y * width);
 
-      int baryZ = tri[i].z * 10000;
-      atomicMin(&depthBuf[index], baryZ);
-
-      if (depthBuf[index] == baryZ) {
-        fragBuf[index].eyePos = (prim.v[0].eyePos * tri[i].x + prim.v[1].eyePos * tri[i].y + prim.v[2].eyePos * tri[i].x);
-        fragBuf[index].eyeNor = (prim.v[0].eyeNor * tri[i].x + prim.v[1].eyeNor * tri[i].y + prim.v[2].eyeNor * tri[i].x);
-        fragBuf[index].color = glm::vec3(0.98);
-      }
+  #if DEBUG_DEPTH
+      fragBuf[index].color = glm::abs(glm::vec3(1.f + tri[i].z));
+  #elif DEBUG_NORMALS
+      fragBuf[index].color = prim.v[i].eyeNor;
+  #else
+      fragBuf[index].color = glm::vec3(0.98);
+  #endif
+    
     }
+
+#elif WIREFRAME
+
+    drawLine(tri[0], tri[1], fragBuf, depthBuf, width, height);
+    drawLine(tri[1], tri[2], fragBuf, depthBuf, width, height);
+    drawLine(tri[2], tri[0], fragBuf, depthBuf, width, height);
 
 #else
 
@@ -851,7 +883,7 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
 
 #if DEBUG_DEPTH
 
-          fragBuf[index].color = glm::vec3(baryZ / 10000.f);
+          fragBuf[index].color = glm::abs(glm::vec3(1.f - baryZ / 10000.f)); //glm::vec3(baryZ / 10000.f);
 
 #elif DEBUG_NORMALS
 
@@ -872,7 +904,6 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
           fragBuf[index].dev_diffuseTex = prim.v[0].dev_diffuseTex;
           fragBuf[index].texWidth = prim.v[0].texWidth;
           fragBuf[index].texHeight = prim.v[0].texHeight;
-
 #else // lambert
 
           fragBuf[index].color = glm::vec3(0.98);
@@ -881,11 +912,6 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
         }
       }
     }
-
-    // PLOT VERTICES
-    /*for (int i = 0; i < 3; i++) {
-      fragBuf[int(tri[i].x + (tri[i].y * width))].color = glm::vec3(0.f, 0.98, 0.f);
-    }*/
 
 #endif
 
