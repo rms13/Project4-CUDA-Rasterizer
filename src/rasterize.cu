@@ -18,18 +18,25 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include <thrust/execution_policy.h>
+#include <thrust/partition.h>
+
 #define POINTS 0
 #define WIREFRAME 0
 
 #define DEBUG_DEPTH 0
 #define DEBUG_NORMALS 0
 
-#define TEXTURE 1
-#define TEXTURE_PERSP_CORRECT 1
-#define TEXTURE_BILINEAR_FILT 1
+#define TEXTURE 0
+#define TEXTURE_PERSP_CORRECT 0
+#define TEXTURE_BILINEAR_FILT 0
 
-#define BLUR 1
-#define BLUR_SHARED 1
+#define BLUR 0
+#define BLUR_SHARED 0
+
+#define BBOX_OPTIMIZATIONS 0
+#define BACK_FACE_CULLING 0
+#define BACK_FACE_CULLING_WITHOUT_COMPACTION 0
 
 namespace {
 
@@ -66,6 +73,7 @@ namespace {
 	struct Primitive {
 		PrimitiveType primitiveType = Triangle;	// C++ 11 init
 		VertexOut v[3];
+    bool back = false; // used for back face culling
 	};
 
 	struct Fragment {
@@ -118,15 +126,19 @@ static std::map<std::string, std::vector<PrimitiveDevBufPointers>> mesh2Primitiv
 static int width = 0;
 static int height = 0;
 
+static int totalNumPrimitivesCompact = 0; // updated after compaction by culling
 static int totalNumPrimitives = 0;
 static Primitive *dev_primitives = NULL;
 static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
 
+static int * dev_depth = NULL;	// you might need this buffer when doing depth test
+
 static glm::vec3 *dev_postBuffer1 = NULL;
 static glm::vec3 *dev_postBuffer2 = NULL;
 
-static int * dev_depth = NULL;	// you might need this buffer when doing depth test
+static Primitive *dev_primitives_compact = NULL;
+//static Primitive *dev_primitives_removed = NULL;
 
 // gaussian kernel
 // source: http://www.sunsetlakesoftware.com/2013/10/21/optimizing-gaussian-blurs-mobile-gpu
@@ -409,7 +421,8 @@ void postBlend(int w, int h, glm::vec3 *frameBuffer, int *depthBuffer, glm::vec3
   int index = x + (y * w);
 
   if (x < w && y < h) {
-    float z = depthBuffer[index] / 10000.f;
+    float z = depthBuffer[index] * .0001f;
+    z = z < 0.5 ? fabs(z - 0.5) * 4.f : fabs(z - 0.5) * 2.f;
     postBuffer[index] *= z;
     postBuffer[index] += (1 - z) * frameBuffer[index];
   }
@@ -833,6 +846,9 @@ void rasterizeSetBuffers(const tinygltf::Scene & scene) {
 	// 3. Malloc for dev_primitives
 	{
 		cudaMalloc(&dev_primitives, totalNumPrimitives * sizeof(Primitive));
+#if BACK_FACE_CULLING
+    cudaMalloc(&dev_primitives_compact, totalNumPrimitives * sizeof(Primitive));
+#endif
 	}
 	
 
@@ -872,10 +888,10 @@ void _vertexTransformAndAssembly(
 		// Then divide the pos by its w element to transform into NDC space
 		// Finally transform x and y to viewport space
 
+    VertexOut &outVert = primitive.dev_verticesOut[vid];
+    
     glm::vec4 inPos(primitive.dev_position[vid], 1.f);
     glm::vec4 outPos;
-    
-    VertexOut &outVert = primitive.dev_verticesOut[vid];
 
     outPos = MVP * inPos; // transform
     outPos /= outPos.w; // rehomogenize
@@ -903,7 +919,6 @@ void _vertexTransformAndAssembly(
 
 
 static int curPrimitiveBeginId = 0;
-
 __global__ 
 void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_primitives, PrimitiveDevBufPointers primitive) {
 
@@ -918,8 +933,20 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 		int pid;	// id for cur primitives vector
 		if (primitive.primitiveMode == TINYGLTF_MODE_TRIANGLES) {
 			pid = iid / (int)primitive.primitiveType;
-			dev_primitives[pid + curPrimitiveBeginId].v[iid % (int)primitive.primitiveType]
-				= primitive.dev_verticesOut[primitive.dev_indices[iid]];
+      VertexOut &vout = primitive.dev_verticesOut[primitive.dev_indices[iid]];
+      dev_primitives[pid + curPrimitiveBeginId].v[iid % (int)primitive.primitiveType]
+        = vout;
+
+#if BACK_FACE_CULLING
+
+      if (glm::dot(/*primitive.dev_normal[primitive.dev_indices[iid]]*/vout.eyeNor, glm::vec3(0.f, 0.f, 1.f)) < 0.f) {
+        dev_primitives[pid + curPrimitiveBeginId].back = true;
+      }
+      else {
+        dev_primitives[pid + curPrimitiveBeginId].back = false;
+      }
+
+#endif
 		}
 
 		// TODO: other primitive types (point, line)
@@ -969,6 +996,12 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
     glm::vec3 tri[3] = { glm::vec3(prim.v[0].pos), 
                          glm::vec3(prim.v[1].pos), 
                          glm::vec3(prim.v[2].pos) };
+    
+#if BACK_FACE_CULLING_WITHOUT_COMPACTION
+    if (glm::dot(prim.v[0].eyeNor, glm::vec3(0.f, 0.f, 1.f)) < 0.f) {
+      return;
+    }
+#endif
 
 #if POINTS
 
@@ -996,7 +1029,31 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
 #else
 
     AABB bbox = getAABBForTriangle(tri);
+
+#if BBOX_OPTIMIZATIONS
+    // return when the entire bbox is outside screen..
+    if (bbox.min.x > width || bbox.max.x<0 || bbox.min.y>height || bbox.max.y < 0) {
+      return;
+    }
+
+    // clip bounding boxes to the screen size.. 
+    // won't cause much divergence as most of the threads 
+    // in a warp would fall in the same category most of the time..
+    if (bbox.min.x < 0) {
+      bbox.min.x = 0.f;
+    }
+    if (bbox.min.y < 0) {
+      bbox.min.y = 0.f;
+    }
+    if (bbox.max.x > width) {
+      bbox.min.x = width;
+    }
+    if (bbox.max.y > height) {
+      bbox.min.x = height;
+    }
     
+#endif
+
     for (int y = bbox.min.y; y <= bbox.max.y; y++) {
       for (int x = bbox.min.x; x <= bbox.max.x; x++) {
 
@@ -1063,6 +1120,16 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
 
 
 /**
+* struct for thrust::partition
+*/
+struct isNotBack {
+  __host__ __device__
+  bool operator()(const Primitive &prim) {
+    return !prim.back;
+  }
+};
+
+/**
  * Perform rasterization.
  */
 void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const glm::mat3 MV_normal) {
@@ -1089,10 +1156,10 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 				dim3 numBlocksForVertices((p->numVertices + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
 				dim3 numBlocksForIndices((p->numIndices + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
 
-				_vertexTransformAndAssembly << < numBlocksForVertices, numThreadsPerBlock >> >(p->numVertices, *p, MVP, MV, MV_normal, width, height);
+				_vertexTransformAndAssembly <<<numBlocksForVertices, numThreadsPerBlock>>> (p->numVertices, *p, MVP, MV, MV_normal, width, height);
 				checkCUDAError("Vertex Processing");
 				cudaDeviceSynchronize();
-				_primitiveAssembly << < numBlocksForIndices, numThreadsPerBlock >> >
+				_primitiveAssembly <<<numBlocksForIndices, numThreadsPerBlock>>>
 					(p->numIndices, 
 					curPrimitiveBeginId, 
 					dev_primitives, 
@@ -1105,9 +1172,32 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 
 		checkCUDAError("Vertex Processing and Primitive Assembly");
 	}
-	
+
+  // stream compact for back face culling..
+
+#if BACK_FACE_CULLING
+  
+  // NULL refers to the array where the removed values would be stored, which we don't require..
+  
+  cudaMemset(dev_primitives_compact, 0, totalNumPrimitives * sizeof(Primitive));
+  Primitive* end = thrust::copy_if(thrust::device, dev_primitives, dev_primitives + totalNumPrimitives, dev_primitives_compact, isNotBack());
+  checkCUDAError("Back face culling: thrust::partition");
+  totalNumPrimitivesCompact = end - dev_primitives_compact;
+
   cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
   initDepth << <blockCount2d, blockSize2d >> > (width, height, dev_depth);
+
+  //// TODO: rasterize
+  dim3 numThreadsPerBlock(128);
+  dim3 numBlocksPerTriangle((totalNumPrimitivesCompact + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
+  _rasterizeTriangles << <numBlocksPerTriangle, numThreadsPerBlock >> >
+    (totalNumPrimitivesCompact, dev_primitives_compact, dev_fragmentBuffer, dev_depth, width, height);
+  checkCUDAError("rasterize triangles");
+
+#else
+	
+  cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
+  initDepth <<<blockCount2d, blockSize2d>>> (width, height, dev_depth);
 
   //// TODO: rasterize
   dim3 numThreadsPerBlock(128);
@@ -1116,8 +1206,11 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
     (totalNumPrimitives, dev_primitives, dev_fragmentBuffer, dev_depth, width, height);
   checkCUDAError("rasterize triangles");
 
+#endif
+
+
   // Copy depthbuffer colors into framebuffer
-  render << <blockCount2d, blockSize2d >> > (width, height, dev_fragmentBuffer, dev_framebuffer);
+  render <<<blockCount2d, blockSize2d>>> (width, height, dev_fragmentBuffer, dev_framebuffer);
   checkCUDAError("fragment shader");
 
 #if BLUR
@@ -1127,6 +1220,15 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
     dim3 threadsX(width), blocksX(height), threadsY(height), blocksY(width);
     bool dirX = true;
     postProcessShared <<<blocksX, threadsX, width * sizeof(glm::vec3)>>> (dirX, width, height, dev_framebuffer, dev_depth, dev_postBuffer1);
+    checkCUDAError("post shader X");
+
+    // blur in y dir
+    dirX = false;
+    postProcessShared <<<blocksY, threadsY, height * sizeof(glm::vec3)>>> (dirX, width, height, dev_postBuffer1, dev_depth, dev_postBuffer2);
+    checkCUDAError("post shader Y");
+
+    dirX = true;
+    postProcessShared <<<blocksX, threadsX, width * sizeof(glm::vec3)>>> (dirX, width, height, dev_postBuffer2, dev_depth, dev_postBuffer1);
     checkCUDAError("post shader X");
 
     // blur in y dir
@@ -1160,7 +1262,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 #else
 
   // Copy framebuffer into OpenGL buffer for OpenGL previewing
-  sendImageToPBO << <blockCount2d, blockSize2d >> > (pbo, width, height, dev_framebuffer);
+  sendImageToPBO <<<blockCount2d, blockSize2d>>> (pbo, width, height, dev_framebuffer);
   checkCUDAError("copy render result to pbo");
 
 #endif
@@ -1209,6 +1311,9 @@ void rasterizeFree() {
 
   cudaFree(dev_depth);
   dev_depth = NULL;
+
+  cudaFree(dev_primitives_compact);
+  dev_primitives = NULL;
 
   checkCUDAError("rasterize Free");
 }
