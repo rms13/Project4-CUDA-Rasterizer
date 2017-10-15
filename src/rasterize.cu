@@ -24,9 +24,12 @@
 #define DEBUG_DEPTH 0
 #define DEBUG_NORMALS 0
 
-#define TEXTURE 0
-#define TEXTURE_PERSP_CORRECT 0
-#define TEXTURE_BILINEAR_FILT 0
+#define TEXTURE 1
+#define TEXTURE_PERSP_CORRECT 1
+#define TEXTURE_BILINEAR_FILT 1
+
+#define BLUR 1
+#define BLUR_SHARED 1
 
 namespace {
 
@@ -120,7 +123,54 @@ static Primitive *dev_primitives = NULL;
 static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
 
+static glm::vec3 *dev_postBuffer1 = NULL;
+static glm::vec3 *dev_postBuffer2 = NULL;
+
 static int * dev_depth = NULL;	// you might need this buffer when doing depth test
+
+// gaussian kernel
+// source: http://www.sunsetlakesoftware.com/2013/10/21/optimizing-gaussian-blurs-mobile-gpu
+// source: http://rastergrid.com/blog/2010/09/efficient-gaussian-blur-with-linear-sampling/
+__constant__ float mat[5] = 
+  { 0.2270270270, 0.1945945946, 0.1216216216, 0.0540540541, 0.0162162162 };
+
+/**
+* Called once at the beginning of the program to allocate memory.
+*/
+void rasterizeInit(int w, int h) {
+  width = w;
+  height = h;
+  cudaFree(dev_fragmentBuffer);
+  cudaMalloc(&dev_fragmentBuffer, width * height * sizeof(Fragment));
+  cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
+  cudaFree(dev_framebuffer);
+  cudaMalloc(&dev_framebuffer, width * height * sizeof(glm::vec3));
+  cudaMemset(dev_framebuffer, 0, width * height * sizeof(glm::vec3));
+
+  cudaMalloc(&dev_postBuffer1, width * height * sizeof(glm::vec3));
+  cudaMemset(dev_postBuffer1, 0, width * height * sizeof(glm::vec3));
+  cudaMalloc(&dev_postBuffer2, width * height * sizeof(glm::vec3));
+  cudaMemset(dev_postBuffer2, 0, width * height * sizeof(glm::vec3));
+
+  cudaFree(dev_depth);
+  cudaMalloc(&dev_depth, width * height * sizeof(int));
+
+  checkCUDAError("rasterizeInit");
+}
+
+__global__
+void initDepth(int w, int h, int * depth)
+{
+  int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+  int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+
+  if (x < w && y < h)
+  {
+    int index = x + (y * w);
+    depth[index] = INT_MAX;
+  }
+}
+
 
 /**
  * Kernel that writes the image to the OpenGL PBO directly.
@@ -190,7 +240,6 @@ glm::vec3 getBilinearFilteredColor(Fragment &fragment, glm::vec2 uv) {
 }
 
 
-
 /** 
 * Writes fragment colors to the framebuffer
 */
@@ -216,6 +265,7 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
 
 #elif TEXTURE
       if (frag.dev_diffuseTex != NULL) {
+
   #if TEXTURE_BILINEAR_FILT
         glm::vec2 uv(frag.texcoord0.x * frag.texWidth, frag.texcoord0.y * frag.texHeight);
         outPix = getBilinearFilteredColor(frag, uv);
@@ -223,55 +273,146 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
         glm::vec2 uv(frag.texcoord0.x * frag.texWidth, frag.texcoord0.y * frag.texHeight);
         outPix = getColor(frag, uv);
   #endif
+
         // LAMBERT SHADING:
         glm::vec3 lightDir = glm::normalize(frag.eyePos - glm::vec3(1.f));
-        outPix *= fabs(glm::dot(lightDir, frag.eyeNor));
+        outPix *= glm::max(fabs(glm::dot(lightDir, frag.eyeNor)), 0.2f);
       }
       else {
-        outPix = glm::vec3();
+        outPix = glm::vec3(); // reset color..
       }
 
 #else
+
       // LAMBERT SHADING:
       glm::vec3 lightDir = glm::normalize(frag.eyePos - glm::vec3(1.f));
       glm::vec3 col = frag.color * fabs(glm::dot(lightDir, frag.eyeNor));
       outPix = col;
+
 #endif
 
       outPix = glm::clamp(outPix, 0.f, 1.f);
     }
 }
 
+
+
 /**
- * Called once at the beginning of the program to allocate memory.
- */
-void rasterizeInit(int w, int h) {
-  width = w;
-  height = h;
-  cudaFree(dev_fragmentBuffer);
-  cudaMalloc(&dev_fragmentBuffer, width * height * sizeof(Fragment));
-  cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
-  cudaFree(dev_framebuffer);
-  cudaMalloc(&dev_framebuffer, width * height * sizeof(glm::vec3));
-  cudaMemset(dev_framebuffer, 0, width * height * sizeof(glm::vec3));
+* Post Processing Shader
+* operates on framebuffer
+* uses the __constant__ gaussian kernel defined above..
+*/
+__global__
+void postProcess(bool dirX, int w, int h, glm::vec3 *frameBuffer, int* depthBuffer, glm::vec3 *postBuffer) {
+  int x = dirX ? threadIdx.x : blockIdx.x;
+  int y = dirX ? blockIdx.x : threadIdx.x;
+  int index = x + (y * w);
 
-  cudaFree(dev_depth);
-  cudaMalloc(&dev_depth, width * height * sizeof(int));
+  if (x < w && y < h) {
 
-  checkCUDAError("rasterizeInit");
+    glm::vec3 col = mat[0] * frameBuffer[index];
+    if (dirX) {
+      for (int i = 1; i < 5; i++) {
+        if (x + i < w) {
+          col += mat[i] * frameBuffer[(x + i) + y * w];
+        }
+        if (x - i >= 0) {
+          col += mat[i] * frameBuffer[(x - i) + y * w];
+        }
+      }
+    }
+    else {
+      for (int i = 1; i < 5; i++) {
+        if (y + i < h) {
+          col += mat[i] * frameBuffer[x + (y + i) * w];
+        }
+        if (y - i >= 0) {
+          col += mat[i] * frameBuffer[x + (y - i) * w];
+        }
+      }
+    }
+
+    postBuffer[index] = col;
+    /*float wt = depthBuffer[index] * 0.0001f;
+    postBuffer[index] = wt * frameBuffer[index] + (1.f - wt) * col;*/
+  }
+  else {
+    postBuffer[index] = frameBuffer[index];
+  }
 }
 
 __global__
-void initDepth(int w, int h, int * depth)
-{
-	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
-	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+void postProcessShared(bool dirX, int w, int h, glm::vec3 *frameBuffer, int* depthBuffer, glm::vec3 *postBuffer) {
+  int x = dirX ? threadIdx.x : blockIdx.x;
+  int y = dirX ? blockIdx.x : threadIdx.x;
+  int index = x + (y * w);
 
-	if (x < w && y < h)
-	{
-		int index = x + (y * w);
-		depth[index] = INT_MAX;
-	}
+  if (x >= w || y >= h) {
+    return;
+  }
+
+  // https://devblogs.nvidia.com/parallelforall/using-shared-memory-cuda-cc/
+  extern __shared__ glm::vec3 sm[];
+  if (dirX) {
+    sm[x] = frameBuffer[index];
+  }
+  else {
+    sm[y] = frameBuffer[index];
+  }
+  __syncthreads();
+
+  int depth = depthBuffer[index];
+  glm::vec3 col;
+  if (dirX) {
+    col = mat[0] * sm[x];
+    for (int i = 1; i < 5; i++) {
+      if (x + i < w) {
+        if (abs(depthBuffer[(x + i) + y * w] - depth) < 10000) {
+          col += mat[i] * sm[x + i];
+        }
+      }
+      if (x - i >= 0) {
+        if (abs(depthBuffer[(x - i) + y * w] - depth) < 10000) {
+          col += mat[i] * sm[x - i];
+        }
+      }
+    }
+  }
+  else {
+    col = mat[0] * sm[y];
+    for (int i = 1; i < 5; i++) {
+      if (y + i < h) {
+        if (abs(depthBuffer[x + (y + i) * w] - depth) < 10000) {
+          col += mat[i] * sm[y + i];
+        }
+      }
+      if (y - i >= 0) {
+        if (abs(depthBuffer[x + (y - i) * w] - depth) < 10000) {
+          col += mat[i] * sm[y - i];
+        }
+      }
+    }
+  }
+
+  postBuffer[index] = col;
+}
+
+
+/**
+* Blend kernel for DOF
+* reference: https://mynameismjp.wordpress.com/the-museum/samples-tutorials-tools/depth-of-field-sample/
+*/
+__global__
+void postBlend(int w, int h, glm::vec3 *frameBuffer, int *depthBuffer, glm::vec3 *postBuffer) {
+  int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+  int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+  int index = x + (y * w);
+
+  if (x < w && y < h) {
+    float z = depthBuffer[index] / 10000.f;
+    postBuffer[index] *= z;
+    postBuffer[index] += (1 - z) * frameBuffer[index];
+  }
 }
 
 
@@ -782,6 +923,7 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 		}
 
 		// TODO: other primitive types (point, line)
+    // point, line handled in rasterization..
 	}
 	
 }
@@ -870,6 +1012,7 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
         int index = x + (y * width);
         
         // http://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#atomicmin
+        //printf("%d\n", depthBuf[index]);
         atomicMin(&depthBuf[index], baryZ);
         
         if (depthBuf[index] == baryZ) {
@@ -976,9 +1119,51 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
   // Copy depthbuffer colors into framebuffer
   render << <blockCount2d, blockSize2d >> > (width, height, dev_fragmentBuffer, dev_framebuffer);
   checkCUDAError("fragment shader");
+
+#if BLUR
+  #if BLUR_SHARED
+
+    // blur in x dir
+    dim3 threadsX(width), blocksX(height), threadsY(height), blocksY(width);
+    bool dirX = true;
+    postProcessShared <<<blocksX, threadsX, width * sizeof(glm::vec3)>>> (dirX, width, height, dev_framebuffer, dev_depth, dev_postBuffer1);
+    checkCUDAError("post shader X");
+
+    // blur in y dir
+    dirX = false;
+    postProcessShared <<<blocksY, threadsY, height * sizeof(glm::vec3)>>> (dirX, width, height, dev_postBuffer1, dev_depth, dev_postBuffer2);
+    checkCUDAError("post shader Y");
+
+  #else
+
+    // blur in x dir
+    dim3 threadsX(width), threadsY(height), blocksX(height), blocksY(width);
+    bool dirX = true;
+    postProcess <<<blocksX, threadsX>>> (dirX, width, height, dev_framebuffer, dev_depth, dev_postBuffer1);
+    checkCUDAError("post shader X");
+
+    // blur in y dir
+    dirX = false;
+    postProcess <<<blocksY, threadsY>>> (dirX, width, height, dev_postBuffer1, dev_depth, dev_postBuffer2);
+    checkCUDAError("post shader Y");
+
+  #endif
+
+    // blend for DOF
+    postBlend <<<blockCount2d, blockSize2d>>> (width, height, dev_framebuffer, dev_depth, dev_postBuffer2);
+    checkCUDAError("copy post render result to pbo");
+
+    // Copy framebuffer into OpenGL buffer for OpenGL previewing
+    sendImageToPBO <<<blockCount2d, blockSize2d>>> (pbo, width, height, dev_postBuffer2);
+    checkCUDAError("copy post render result to pbo");
+
+#else
+
   // Copy framebuffer into OpenGL buffer for OpenGL previewing
   sendImageToPBO << <blockCount2d, blockSize2d >> > (pbo, width, height, dev_framebuffer);
   checkCUDAError("copy render result to pbo");
+
+#endif
 }
 
 /**
@@ -988,36 +1173,42 @@ void rasterizeFree() {
 
     // deconstruct primitives attribute/indices device buffer
 
-	auto it(mesh2PrimitivesMap.begin());
-	auto itEnd(mesh2PrimitivesMap.end());
-	for (; it != itEnd; ++it) {
-		for (auto p = it->second.begin(); p != it->second.end(); ++p) {
-			cudaFree(p->dev_indices);
-			cudaFree(p->dev_position);
-			cudaFree(p->dev_normal);
-			cudaFree(p->dev_texcoord0);
-			cudaFree(p->dev_diffuseTex);
+  auto it(mesh2PrimitivesMap.begin());
+  auto itEnd(mesh2PrimitivesMap.end());
+  for (; it != itEnd; ++it) {
+    for (auto p = it->second.begin(); p != it->second.end(); ++p) {
+      cudaFree(p->dev_indices);
+      cudaFree(p->dev_position);
+      cudaFree(p->dev_normal);
+      cudaFree(p->dev_texcoord0);
+      cudaFree(p->dev_diffuseTex);
 
-			cudaFree(p->dev_verticesOut);
+      cudaFree(p->dev_verticesOut);
 
-			
-			//TODO: release other attributes and materials
-		}
-	}
 
-	////////////
+      //TODO: release other attributes and materials
+    }
+  }
 
-    cudaFree(dev_primitives);
-    dev_primitives = NULL;
+  ////////////
 
-	cudaFree(dev_fragmentBuffer);
-	dev_fragmentBuffer = NULL;
+  cudaFree(dev_primitives);
+  dev_primitives = NULL;
 
-    cudaFree(dev_framebuffer);
-    dev_framebuffer = NULL;
+  cudaFree(dev_fragmentBuffer);
+  dev_fragmentBuffer = NULL;
 
-	cudaFree(dev_depth);
-	dev_depth = NULL;
+  cudaFree(dev_framebuffer);
+  dev_framebuffer = NULL;
 
-    checkCUDAError("rasterize Free");
+  cudaFree(dev_postBuffer1);
+  dev_postBuffer1 = NULL;
+
+  cudaFree(dev_postBuffer2);
+  dev_postBuffer2 = NULL;
+
+  cudaFree(dev_depth);
+  dev_depth = NULL;
+
+  checkCUDAError("rasterize Free");
 }
