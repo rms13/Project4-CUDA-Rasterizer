@@ -11,6 +11,10 @@ CUDA Rasterizer
 ## Overview
 In this project, I implemented a Rasterizer using CUDA. Rasterization is a technique used to draw 3D geometry on the screen in real-time. The geometry is in the form of vertices which are to be converted into geometry primitives (like triangles), and plotted on the screen.
 
+![duck](renders/duck_gif.gif)
+
+*the artefacts are due to gif compression and is not seen during actual run of the program*
+
 ## Functionalities Implemented
 
 * Pipeline Stages:
