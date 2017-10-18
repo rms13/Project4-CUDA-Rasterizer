@@ -21,26 +21,29 @@
 #include <thrust/execution_policy.h>
 #include <thrust/partition.h>
 
+#include <chrono>
+
 #define POINTS 0
 #define WIREFRAME 0
 
 #define DEBUG_DEPTH 0
 #define DEBUG_NORMALS 0
 
-#define TEXTURE 1
-#define TEXTURE_PERSP_CORRECT 1
-#define TEXTURE_BILINEAR_FILT 1
+#define TEXTURE 0
+#define TEXTURE_PERSP_CORRECT 0
+#define TEXTURE_BILINEAR_FILT 0
 
 #define BLUR 0
 #define BLUR_SHARED 0
 
-#define SSAO 0 // WORK UNDER PROGRESS
+#define SSAO 0 // SCREEN SPACE AMBIENT OCCLUSION : WORK UNDER PROGRESS 
 
-#define BBOX_OPTIMIZATIONS 0
+#define BBOX_OPTIMIZATIONS 1
 #define BACK_FACE_CULLING 0
 #define BACK_FACE_CULLING_WITHOUT_COMPACTION 0
 
-#define SSAA 1
+#define SSAA 2 // SUPERSAMPLE ANTIALIASING
+               // 1 (min value : no AA), 2, 4, ...
 
 namespace {
 
@@ -92,7 +95,6 @@ namespace {
 		VertexAttributeTexcoord texcoord0;
 		TextureData* dev_diffuseTex = NULL;
     int texWidth, texHeight;
-    int shadowZ = INT_MAX;
 		// ...
 	};
 
@@ -144,8 +146,6 @@ static glm::vec3 *dev_postBuffer2 = NULL;
 
 static Primitive *dev_primitives_compact = NULL;
 
-static int * dev_shadow = NULL;
-
 // gaussian kernel
 // source: http://www.sunsetlakesoftware.com/2013/10/21/optimizing-gaussian-blurs-mobile-gpu
 // source: http://rastergrid.com/blog/2010/09/efficient-gaussian-blur-with-linear-sampling/
@@ -177,14 +177,11 @@ void rasterizeInit(int w, int h) {
   cudaFree(dev_mutex);
   cudaMalloc(&dev_mutex, width * height * sizeof(int));
 
-  cudaFree(dev_shadow);
-  cudaMalloc(&dev_shadow, width * height * sizeof(int));
-
   checkCUDAError("rasterizeInit");
 }
 
 __global__
-void initDepth(int w, int h, int *depth, int *shadow)
+void initDepth(int w, int h, int *depth)
 {
   int x = (blockIdx.x * blockDim.x) + threadIdx.x;
   int y = (blockIdx.y * blockDim.y) + threadIdx.y;
@@ -193,7 +190,6 @@ void initDepth(int w, int h, int *depth, int *shadow)
   {
     int index = x + (y * w);
     depth[index] = INT_MAX;
-    //shadow[index] = INT_MAX;
   }
 }
 
@@ -279,7 +275,7 @@ glm::vec3 getBilinearFilteredColor(Fragment &fragment, glm::vec2 uv) {
 * Writes fragment colors to the framebuffer
 */
 __global__
-void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer, int *shadowMap) {
+void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
     int x = (blockIdx.x * blockDim.x) + threadIdx.x;
     int y = (blockIdx.y * blockDim.y) + threadIdx.y;
     
@@ -293,11 +289,6 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer, int 
         outPix *= 0.f;
         return;
       }
-
-      /*if (shadowMap[index] == INT_MAX) {
-        outPix *= 0.f;
-        return;
-      }*/
 		  
 #if POINTS || WIREFRAME
       outPix = frag.color;
@@ -331,12 +322,6 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer, int 
 
       // LAMBERT SHADING:
 
-     // printf("%d, %d \n", shadowMap[index], frag.shadowZ);
-      /*if (frag.shadowZ > shadowMap[index]) {
-        frag.color *= 0.1;
-        frag.color.x = 1.f;
-      }*/
-
       glm::vec3 lightDir = frag.eyePos - glm::vec3(light[0], light[1], light[2]);
       lightDir = glm::normalize(lightDir);
       float dot = glm::dot(-lightDir, frag.eyeNor);
@@ -347,8 +332,6 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer, int 
       outPix = col;
 
 #endif
-
-   //   outPix = glm::clamp(outPix, 0.f, 1.f);
     }
 }
 
@@ -1022,7 +1005,7 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 
 #if BACK_FACE_CULLING
 
-      if (glm::dot(/*primitive.dev_normal[primitive.dev_indices[iid]]*/vout.eyeNor, glm::vec3(0.f, 0.f, 1.f)) < 0.f) {
+      if (glm::dot(vout.eyeNor, glm::vec3(0.f, 0.f, 1.f)) < 0.f) {
         dev_primitives[pid + curPrimitiveBeginId].back = true;
       }
       else {
@@ -1066,12 +1049,7 @@ void drawLine(glm::vec3 A, glm::vec3 B, Fragment *fragBuf, int width) {
 
 
 __global__
-void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragBuf, int *depthBuf, int *mutex, int *shadowBuf, int width, int height) {
-
-  // get triangle
-  // loop through the pixels in the bbox
-  // find intersection
-  // compute fragment color at the point
+void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragBuf, int *depthBuf, int *mutex, int width, int height) {
 
   // index id
   int tid = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -1156,16 +1134,6 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
           + prim.v[1].eyePos * baryCoord.y
           + prim.v[2].eyePos * baryCoord.z;
 
-        // Shadow Map..
-        //glm::vec3 lightDir = eyePosition - glm::vec3(light[0], light[1], light[2]);
-        //int shadowZ = glm::length(lightDir) * 10000;
-        ////printf("%d, %d \n", shadowBuf[index], shadowZ);
-        //atomicMin(&shadowBuf[index], shadowZ);
-
-        // http://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#atomicmin
-        //printf("%d\n", depthBuf[index]);
-        //atomicMin(&depthBuf[index], baryZ);
-
         bool isSet;
         do {
           isSet = (atomicCAS(&mutex[index], 0, 1) == 0);
@@ -1177,15 +1145,13 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
 
               fragBuf[index].eyePos = eyePosition;
 
-              //fragBuf[index].shadowZ = shadowZ;
-
               fragBuf[index].eyeNor = prim.v[0].eyeNor * baryCoord.x
                 + prim.v[1].eyeNor * baryCoord.y
                 + prim.v[2].eyeNor * baryCoord.z;
 
 #if DEBUG_DEPTH
 
-              fragBuf[index].color = glm::abs(glm::vec3(1.f - baryZ / 10000.f)); //glm::vec3(baryZ / 10000.f);
+              fragBuf[index].color = glm::abs(glm::vec3(1.f - baryZ / 10000.f)); 
 
 #elif DEBUG_NORMALS
 
@@ -1208,11 +1174,8 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
               fragBuf[index].texHeight = prim.v[0].texHeight;
 
               fragBuf[index].color = glm::vec3(0.98);
-
 #else // lambert
-
               fragBuf[index].color = glm::vec3(0.98);
-
 #endif
             }
             mutex[index] = 0;
@@ -1228,7 +1191,7 @@ void _rasterizeTriangles(int numTris, Primitive *dev_primitives, Fragment *fragB
 
 
 /**
-* struct for thrust::partition
+* predicate struct for thrust::copy_if
 */
 struct isNotBack {
   __host__ __device__
@@ -1283,10 +1246,10 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 
   cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
   cudaMemset(dev_mutex, 0, width * height * sizeof(int));
-  initDepth << <blockCount2d, blockSize2d >> > (width, height, dev_depth, dev_shadow);
+  initDepth << <blockCount2d, blockSize2d >> > (width, height, dev_depth);
 
 #if BACK_FACE_CULLING
-  
+
   cudaMemset(dev_primitives_compact, 0, totalNumPrimitives * sizeof(Primitive));
   Primitive* end = thrust::copy_if(thrust::device, dev_primitives, dev_primitives + totalNumPrimitives, dev_primitives_compact, isNotBack());
   checkCUDAError("Back face culling: thrust::partition");
@@ -1296,7 +1259,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
   dim3 numThreadsPerBlock(128);
   dim3 numBlocksPerTriangle((totalNumPrimitivesCompact + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
   _rasterizeTriangles << <numBlocksPerTriangle, numThreadsPerBlock >> >
-    (totalNumPrimitivesCompact, dev_primitives_compact, dev_fragmentBuffer, dev_depth, dev_mutex, dev_shadow, width, height);
+    (totalNumPrimitivesCompact, dev_primitives_compact, dev_fragmentBuffer, dev_depth, dev_mutex, width, height);
   checkCUDAError("rasterize triangles");
 
 #else
@@ -1305,8 +1268,9 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
   dim3 numThreadsPerBlock(128);
   dim3 numBlocksPerTriangle((totalNumPrimitives + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
   _rasterizeTriangles <<<numBlocksPerTriangle, numThreadsPerBlock>>>
-    (totalNumPrimitives, dev_primitives, dev_fragmentBuffer, dev_depth, dev_mutex, dev_shadow, width, height);
+    (totalNumPrimitives, dev_primitives, dev_fragmentBuffer, dev_depth, dev_mutex, width, height);
   checkCUDAError("rasterize triangles");
+
 
 #endif
 
@@ -1318,12 +1282,15 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 
 #endif
 
-  // Copy fragmentbuffer colors into framebuffer
-  render <<<blockCount2d, blockSize2d>>> (width, height, dev_fragmentBuffer, dev_framebuffer, dev_shadow);
+  // Copy fragmentbuffer colors into framebuffer [frame buffer is sent for post processing]
+  render <<<blockCount2d, blockSize2d>>> (width, height, dev_fragmentBuffer, dev_framebuffer);
   checkCUDAError("fragment shader");
 
 #if BLUR
   #if BLUR_SHARED
+
+    // Doing seperate blur in X and then in Y to make things faster.. 
+    // Using 2 postbuffers to avoid over-writing and collision between threads while doing blurring in Y dir..
 
     // blur in x dir
     dim3 threadsX(width), blocksX(height), threadsY(height), blocksY(width);
@@ -1336,6 +1303,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
     postProcessShared <<<blocksY, threadsY, height * sizeof(glm::vec3)>>> (dirX, width, height, dev_postBuffer1, dev_depth, dev_postBuffer2);
     checkCUDAError("post shader Y");
 
+    // 2nd pass for more blurring..
     dirX = true;
     postProcessShared <<<blocksX, threadsX, width * sizeof(glm::vec3)>>> (dirX, width, height, dev_postBuffer2, dev_depth, dev_postBuffer1);
     checkCUDAError("post shader X");
@@ -1347,6 +1315,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 
   #else
 
+    // This version doesn't use shared memory. It is implemented only for the sake of comparison
     // blur in x dir
     dim3 threadsX(width), threadsY(height), blocksX(height), blocksY(width);
     bool dirX = true;
@@ -1426,9 +1395,6 @@ void rasterizeFree() {
 
   cudaFree(dev_mutex);
   dev_mutex = NULL;
-
-  cudaFree(dev_shadow);
-  dev_depth = NULL;
 
   cudaFree(dev_primitives_compact);
   dev_primitives = NULL;
