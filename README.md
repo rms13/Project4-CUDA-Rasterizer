@@ -86,6 +86,8 @@ Also, as can be seen in the third image, I implemented backface culling. Here, w
 |Cull without compaction|0.0|1.10222|
 |Cull with compaction|1.71259|0.499752|
 
+![chart](renders/chart.png)
+
 * Backface culling has some performance boost, but I think it would be much larger with large scenes with complecated meshes.
 * After compaction, rasterization is dramatically faster, even for simple meshes. But this comes at the cost of the large compaction overhead. This will only be useful when the scene is too large and the output resolution is also very high.
 
@@ -115,6 +117,8 @@ Depth of field can be obtained by adding a blend stage between the blur result a
 | Without shared memory | With shared memory |
 | ----- | ----- |
 |6.93293|4.63802|
+
+![chart](renders/chart_1.png)
 
 * As expected, blurring is much faster with shared memory.
 * This performance gain would double when we apply the blurring twice for DOF.
